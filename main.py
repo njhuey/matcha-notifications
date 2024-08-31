@@ -1,8 +1,11 @@
 from typing import TypedDict
+from datetime import datetime
+from pathlib import Path
 import requests
 
 from bs4 import BeautifulSoup
 import pandas as pd
+import duckdb
 
 MATCHA_PRODUCTS = [
     "https://www.marukyu-koyamaen.co.jp/english/shop/products/1161020c1/",
@@ -10,11 +13,13 @@ MATCHA_PRODUCTS = [
     "https://www.marukyu-koyamaen.co.jp/english/shop/products/1191040c1/",
 ]
 
+DB_PATH = Path("matcha-products.ddb")
+
 
 class ProductSize(TypedDict):
-    product_name: str
+    name: str
     size: str
-    out_of_stock: bool
+    available: bool
 
 
 def scrape_matcha_availability(product: str) -> pd.DataFrame:
@@ -35,13 +40,95 @@ def scrape_matcha_availability(product: str) -> pd.DataFrame:
 
         product_sizes.append(
             {
-                "product_name": product_name,
+                "name": product_name,
                 "size": size,
-                "out_of_stock": "out-of-stock" in str(div),
+                "available": "out-of-stock" not in str(div),
             }
         )
 
     return pd.DataFrame(product_sizes)
+
+
+def update_product(product_status: pd.Series, conn: duckdb.DuckDBPyConnection) -> bool:
+    """
+    Update product with latest data scraped from the web.
+
+    Returns
+    -------
+    bool : True if the status of the item has become available since the last run.
+    """
+    row = conn.execute(
+        """
+SELECT available
+FROM product
+WHERE name = ? AND size = ?;
+""",
+        (product_status["name"], product_status["size"]),
+    ).fetchone()
+
+    newly_available = False
+    match row:
+        case (previously_available,):
+            if not previously_available and product_status["available"]:
+                newly_available = True
+            conn.execute(
+                """
+UPDATE product
+SET available = ?, last_modified = ?
+WHERE name = ? AND size = ?;
+""",
+                (product_status["available", datetime.now()]),
+            )
+        case None:
+            conn.execute(
+                """
+INSERT INTO product (name, size, available, created_date, last_modified)
+VALUES (?, ?, ?, ?, ?);
+""",
+                (
+                    product_status["name"],
+                    product_status["size"],
+                    product_status["available"],
+                    datetime.now(),
+                    datetime.now(),
+                ),
+            )
+        case _:
+            raise ValueError(
+                "When accessing `product` table, received a non-sensical response. Exiting."  # NOQA: E501
+            )
+    return newly_available
+
+
+def track_availibility(product_statuses: pd.DataFrame) -> pd.DataFrame:
+    """
+    Track the changes in availibility of each matcha product size combination.
+
+    Uses `duckdb` to inspect when an unavailable item becomes available and returns a
+    `DataFrame` with the newly available items.
+    """
+    conn = duckdb.connect(str(DB_PATH))
+
+    conn.query(
+        """
+CREATE TABLE IF NOT EXISTS product (
+    name VARCHAR,
+    size VARCHAR,
+    available BOOL,
+    created_date TIME,
+    last_modified TIME,
+    PRIMARY KEY (name, size)
+);
+"""
+    )
+
+    newly_available_products = []
+    for _, product in product_statuses.iterrows():
+        became_available = update_product(product, conn)
+        if became_available:
+            newly_available_products.append(product)
+
+    return pd.DataFrame(newly_available_products)
 
 
 def main() -> None:
@@ -50,16 +137,11 @@ def main() -> None:
     ]
     product_df = pd.concat(product_dfs)
 
-    available = product_df[~product_df["out_of_stock"]]
-    if len(available) == 0:
+    newly_available_products = track_availibility(product_df)
+    if len(newly_available_products) == 0:
         return
 
-    message = f"""
-Available matcha flavors
-
-{str(available[["product_name", "size"]])}
-"""
-    print(message)
+    print(newly_available_products)
 
 
 if __name__ == "__main__":
